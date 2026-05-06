@@ -78,7 +78,7 @@ ADMIN_KEY         = os.environ.get('ADMIN_KEY', '')
 DEFAULT_DAILY     = int(os.environ.get('DEFAULT_DAILY', 500))
 FETCH_INTERVAL    = int(os.environ.get('FETCH_INTERVAL', 60))   # giây
 RETRAIN_INTERVAL  = int(os.environ.get('RETRAIN_INTERVAL', 3600))
-MIN_TRAIN         = int(os.environ.get('MIN_TRAIN', 500))
+MIN_TRAIN         = int(os.environ.get('MIN_TRAIN', 100))
 MAX_SESSIONS      = 20000
 ACCURACY_THRESHOLD = 0.65  # dưới ngưỡng này → trigger retrain
 
