@@ -902,77 +902,68 @@ class Predictor:
                 self._train_lock.release()
         threading.Thread(target=_do, daemon=True).start()
 
-    def predict_next(self) -> Dict:
-        n = self.collector.count(self.game_type)
-        
-        # Nếu chưa đủ phiên -> trả về training status
-        if n < MIN_TRAIN:
+  def predict_next(self) -> Dict:
+    n = self.collector.count(self.game_type)
+    
+    if n < MIN_TRAIN:
+        return {
+            'status': 'training',
+            'message': f'Đang tích lũy dữ liệu: {n}/{MIN_TRAIN}',
+            'progress': f'{min(100, int(n/MIN_TRAIN*100))}%',
+            'type': self.game_type
+        }
+    
+    # Nếu model chưa trained, train đồng bộ ngay lập tức
+    if not self.ensemble.is_trained:
+        log.info(f"[{self.game_type}] Đủ dữ liệu ({n}/{MIN_TRAIN}), bắt đầu train...")
+        feats = self._get_feats()
+        if feats is not None and len(feats) >= MIN_TRAIN:
+            self.ensemble.train(feats)
+            self.ensemble.save()
+            log.info(f"[{self.game_type}] Train hoàn tất!")
+        else:
             return {
                 'status': 'training',
-                'message': f'Đang tích lũy dữ liệu: {n}/{MIN_TRAIN}',
-                'progress': f'{min(100, int(n/MIN_TRAIN*100))}%',
+                'message': f'Đang xử lý dữ liệu: {n}/{MIN_TRAIN}',
+                'progress': '100%',
                 'type': self.game_type
             }
-        
-        # Nếu model chưa trained, thử train đồng bộ lần đầu
-        if not self.ensemble.is_trained:
-            feats = self._get_feats()
-            if feats is not None and len(feats) >= MIN_TRAIN:
-                self.ensemble.train(feats)
-                self.ensemble.save()
-            else:
-                return {
-                    'status': 'training',
-                    'message': f'Đang xử lý dữ liệu: {n}/{MIN_TRAIN}',
-                    'progress': f'{min(100, int(n/MIN_TRAIN*100))}%',
-                    'type': self.game_type
-                }
 
-        # Sau khi đã train xong, dự đoán bình thường
-        feats = self._get_feats()
-        if feats is None or len(feats) == 0:
-            return {'status': 'error', 'message': 'Không đủ dữ liệu'}
+    # Sau khi train xong, dự đoán
+    feats = self._get_feats()
+    if feats is None or len(feats) == 0:
+        return {'status': 'error', 'message': 'Không đủ dữ liệu'}
 
-        fc   = [c for c in feats.columns if c != 'label']
-        last = feats[fc].iloc[-1].values.astype(np.float32)
-        label, prob, arm = self.ensemble.predict(last)
+    fc = [c for c in feats.columns if c != 'label']
+    last = feats[fc].iloc[-1].values.astype(np.float32)
+    label, prob, arm = self.ensemble.predict(last)
 
-        confidence = round(prob * 100) if prob <= 0.95 else 99
-        prediction = 'Tài' if label == 1 else 'Xỉu'
+    confidence = round(prob * 100) if prob <= 0.95 else 99
+    prediction = 'Tài' if label == 1 else 'Xỉu'
 
-        # Get last known phien
-        df = self.collector.get_history(self.game_type, limit=5)
-        last_phien = int(df['id'].iloc[-1]) if len(df) else 0
-        next_phien = last_phien + 1
+    df = self.collector.get_history(self.game_type, limit=5)
+    last_phien = int(df['id'].iloc[-1]) if len(df) else 0
+    next_phien = last_phien + 1
 
-        top_f = self.ensemble.top_features(5)
-        bandit_probs = self.ensemble.bandit.get_probs()
-        slide_acc = self.ensemble.sliding_accuracy()
+    result = {
+        'type': self.game_type,
+        'phien': next_phien,
+        'prediction': prediction,
+        'confidence': confidence,
+        'probability': round(prob, 4),
+        'arm_used': arm,
+        'n_sessions': self.collector.count(self.game_type)
+    }
 
-        result = {
-            'type': self.game_type,
-            'phien': next_phien,
-            'prediction': prediction,
-            'confidence': confidence,
-            'probability': round(prob, 4),
-            'arm_used': arm,
-            'top_features': top_f,
-            'sliding_accuracy': round(slide_acc, 4),
-            'model_accuracy': round(self.ensemble.accuracy, 4),
-            'bandit_weights': {k: round(v, 3) for k, v in bandit_probs.items()},
-            'timestamp': datetime.utcnow().isoformat() + 'Z',
-            'n_sessions': self.collector.count(self.game_type)
-        }
+    conn = get_db()
+    conn.execute(
+        "INSERT INTO predictions (type,phien,prediction,confidence,model_used) VALUES(?,?,?,?,?)",
+        (self.game_type, next_phien, prediction, round(prob,4), arm)
+    )
+    conn.commit()
+    conn.close()
 
-        # Save prediction to DB
-        conn = get_db()
-        conn.execute(
-            "INSERT INTO predictions (type,phien,prediction,confidence,model_used) VALUES(?,?,?,?,?)",
-            (self.game_type, next_phien, prediction, round(prob,4), arm)
-        )
-        conn.commit(); conn.close()
-
-        return result
+    return result
 
     def verify(self, phien: int, actual: str) -> Dict:
         """Cập nhật kết quả thực tế và feedback bandit."""
