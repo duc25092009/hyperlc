@@ -1,6 +1,6 @@
 """
 ╔══════════════════════════════════════════════════════════════════╗
-║   HYPER TÀI XỈU PREDICTOR - v3.0 ULTRA                         ║
+║   HYPER TÀI XỈU PREDICTOR - v3.0 ULTRA (FIXED)                 ║
 ║   Python FastAPI + Full ML Stack                                 ║
 ║   Models: XGBoost + LightGBM + RF + BiLSTM + Ensemble          ║
 ║   Features: 300+ auto-engineered features                        ║
@@ -243,7 +243,7 @@ class DataCollector:
         log.info(f"DataCollector background started (interval={FETCH_INTERVAL}s)")
 
 # ═══════════════════════════════════════════════════════════════════════════════
-#  FEATURE ENGINEER  (300+ features)
+#  FEATURE ENGINEER (300+ features)
 # ═══════════════════════════════════════════════════════════════════════════════
 class FeatureEngineer:
     """Build 300+ features from raw session history."""
@@ -687,7 +687,6 @@ class ModelEnsemble:
         if HAS_TF:
             self.dl = DeepModels()
             n_sel = Xtr_sel.shape[1]
-            # Reshape for sequences (need to use unselected scaled for seq)
             Xtr_seq, ytr_seq = self.dl.make_sequences(Xtr_s, ytr)
             Xvl_seq, yvl_seq = self.dl.make_sequences(Xvl_s, yvl)
             Xte_seq, yte_seq = self.dl.make_sequences(Xte_s, yte)
@@ -739,6 +738,7 @@ class ModelEnsemble:
         except:
             auc = 0.5
 
+        # ========== FIX: MUST SET is_trained = True ==========
         self.is_trained = True
         self.accuracy   = acc
         self.auc        = auc
@@ -903,15 +903,32 @@ class Predictor:
         threading.Thread(target=_do, daemon=True).start()
 
     def predict_next(self) -> Dict:
-        if not self.ensemble.is_trained:
-            n = self.collector.count(self.game_type)
+        n = self.collector.count(self.game_type)
+        
+        # Nếu chưa đủ phiên -> trả về training status
+        if n < MIN_TRAIN:
             return {
                 'status': 'training',
                 'message': f'Đang tích lũy dữ liệu: {n}/{MIN_TRAIN}',
                 'progress': f'{min(100, int(n/MIN_TRAIN*100))}%',
                 'type': self.game_type
             }
+        
+        # Nếu model chưa trained, thử train đồng bộ lần đầu
+        if not self.ensemble.is_trained:
+            feats = self._get_feats()
+            if feats is not None and len(feats) >= MIN_TRAIN:
+                self.ensemble.train(feats)
+                self.ensemble.save()
+            else:
+                return {
+                    'status': 'training',
+                    'message': f'Đang xử lý dữ liệu: {n}/{MIN_TRAIN}',
+                    'progress': f'{min(100, int(n/MIN_TRAIN*100))}%',
+                    'type': self.game_type
+                }
 
+        # Sau khi đã train xong, dự đoán bình thường
         feats = self._get_feats()
         if feats is None or len(feats) == 0:
             return {'status': 'error', 'message': 'Không đủ dữ liệu'}
