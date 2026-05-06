@@ -988,16 +988,15 @@ def predict_next(self) -> Dict:
             'sliding_accuracy': round(self.ensemble.sliding_accuracy(), 4)
         }
 
-    def schedule_retrain(self) -> None:
-        def loop():
-            while True:
-                time.sleep(RETRAIN_INTERVAL)
-                n = self.collector.count(self.game_type)
-                new = n - self._retrain_sessions
-                log.info(f"[{self.game_type}] Scheduled retrain check: n={n}, new={new}")
-                if new >= 100 or self._retrain_sessions == 0:
-                    self.train_async()
-        threading.Thread(target=loop, daemon=True).start()
+def schedule_retrain(self) -> None:
+    def loop():
+        while True:
+            time.sleep(RETRAIN_INTERVAL)
+            n = self.collector.count(self.game_type)
+            log.info(f"[{self.game_type}] Scheduled retrain check: n={n}")
+            if n >= MIN_TRAIN and self.ensemble.is_trained:
+                self.train_async()
+    threading.Thread(target=loop, daemon=True).start()
 
 # ═══════════════════════════════════════════════════════════════════════════════
 #  AUTH MIDDLEWARE
