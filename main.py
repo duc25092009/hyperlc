@@ -1,6 +1,6 @@
 """
 ╔══════════════════════════════════════════════════════════════════╗
-║   HYPER TÀI XỈU PREDICTOR - v3.0 ULTRA (FIXED)                 ║
+║   HYPER TÀI XỈU PREDICTOR - v3.0 ULTRA                         ║
 ║   Python FastAPI + Full ML Stack                                 ║
 ║   Models: XGBoost + LightGBM + RF + BiLSTM + Ensemble          ║
 ║   Features: 300+ auto-engineered features                        ║
@@ -78,7 +78,7 @@ ADMIN_KEY         = os.environ.get('ADMIN_KEY', '')
 DEFAULT_DAILY     = int(os.environ.get('DEFAULT_DAILY', 500))
 FETCH_INTERVAL    = int(os.environ.get('FETCH_INTERVAL', 60))   # giây
 RETRAIN_INTERVAL  = int(os.environ.get('RETRAIN_INTERVAL', 3600))
-MIN_TRAIN         = int(os.environ.get('MIN_TRAIN', 100))
+MIN_TRAIN         = int(os.environ.get('MIN_TRAIN', 500))
 MAX_SESSIONS      = 20000
 ACCURACY_THRESHOLD = 0.65  # dưới ngưỡng này → trigger retrain
 
@@ -243,7 +243,7 @@ class DataCollector:
         log.info(f"DataCollector background started (interval={FETCH_INTERVAL}s)")
 
 # ═══════════════════════════════════════════════════════════════════════════════
-#  FEATURE ENGINEER (300+ features)
+#  FEATURE ENGINEER  (300+ features)
 # ═══════════════════════════════════════════════════════════════════════════════
 class FeatureEngineer:
     """Build 300+ features from raw session history."""
@@ -687,6 +687,7 @@ class ModelEnsemble:
         if HAS_TF:
             self.dl = DeepModels()
             n_sel = Xtr_sel.shape[1]
+            # Reshape for sequences (need to use unselected scaled for seq)
             Xtr_seq, ytr_seq = self.dl.make_sequences(Xtr_s, ytr)
             Xvl_seq, yvl_seq = self.dl.make_sequences(Xvl_s, yvl)
             Xte_seq, yte_seq = self.dl.make_sequences(Xte_s, yte)
@@ -738,7 +739,6 @@ class ModelEnsemble:
         except:
             auc = 0.5
 
-        # ========== FIX: MUST SET is_trained = True ==========
         self.is_trained = True
         self.accuracy   = acc
         self.auc        = auc
@@ -902,58 +902,66 @@ class Predictor:
                 self._train_lock.release()
         threading.Thread(target=_do, daemon=True).start()
 
-def predict_next(self) -> Dict:
-    n = self.collector.count(self.game_type)
-    
-    if n < MIN_TRAIN:
-        return {
-            'status': 'training',
-            'message': f'Đang tích lũy dữ liệu: {n}/{MIN_TRAIN}',
-            'progress': f'{min(100, int(n/MIN_TRAIN*100))}%',
-            'type': self.game_type
-        }
-    
-    # Nếu model chưa trained, TRAIN ĐỒNG BỘ NGAY (chờ xong mới chạy tiếp)
-    if not self.ensemble.is_trained:
-        log.info(f"[{self.game_type}] Đủ dữ liệu ({n}/{MIN_TRAIN}), train đồng bộ...")
-        feats = self._get_feats()
-        if feats is not None and len(feats) >= MIN_TRAIN:
-            self.ensemble.train(feats)  # <-- train đồng bộ
-            self.ensemble.save()
-            log.info(f"[{self.game_type}] Train hoàn tất!")
-        else:
+    def predict_next(self) -> Dict:
+        if not self.ensemble.is_trained:
+            n = self.collector.count(self.game_type)
+            # FIX Bug2: Nếu đủ data nhưng chưa train → trigger train ngay
+            if n >= MIN_TRAIN and not self._train_lock.locked():
+                log.info(f"[{self.game_type}] predict_next: has {n} sessions, triggering train.")
+                self.train_async()
             return {
                 'status': 'training',
-                'message': f'Đang xử lý dữ liệu: {n}/{MIN_TRAIN}',
-                'progress': '100%',
-                'type': self.game_type
+                'message': f'Model đang huấn luyện ({n} ván). Vui lòng thử lại sau 2-3 phút.' if n >= MIN_TRAIN else f'Đang tích lũy dữ liệu: {n}/{MIN_TRAIN}',
+                'progress': f'{min(100, int(n/MIN_TRAIN*100))}%',
+                'type': self.game_type,
+                'n_sessions': n,
+                'min_required': MIN_TRAIN
             }
-    
-    # Sau khi train xong, dự đoán
-    feats = self._get_feats()
-    if feats is None or len(feats) == 0:
-        return {'status': 'error', 'message': 'Không đủ dữ liệu'}
-    
-    fc = [c for c in feats.columns if c != 'label']
-    last = feats[fc].iloc[-1].values.astype(np.float32)
-    label, prob, arm = self.ensemble.predict(last)
-    
-    confidence = round(prob * 100) if prob <= 0.95 else 99
-    prediction = 'Tài' if label == 1 else 'Xỉu'
-    
-    df = self.collector.get_history(self.game_type, limit=5)
-    last_phien = int(df['id'].iloc[-1]) if len(df) else 0
-    next_phien = last_phien + 1
-    
-    return {
-        'type': self.game_type,
-        'phien': next_phien,
-        'prediction': prediction,
-        'confidence': confidence,
-        'probability': round(prob, 4),
-        'arm_used': arm,
-        'n_sessions': self.collector.count(self.game_type)
-    }
+
+        feats = self._get_feats()
+        if feats is None or len(feats) == 0:
+            return {'status': 'error', 'message': 'Không đủ dữ liệu'}
+
+        fc   = [c for c in feats.columns if c != 'label']
+        last = feats[fc].iloc[-1].values.astype(np.float32)
+        label, prob, arm = self.ensemble.predict(last)
+
+        confidence = round(prob * 100) if prob <= 0.95 else 99
+        prediction = 'Tài' if label == 1 else 'Xỉu'
+
+        # Get last known phien
+        df = self.collector.get_history(self.game_type, limit=5)
+        last_phien = int(df['id'].iloc[-1]) if len(df) else 0
+        next_phien = last_phien + 1
+
+        top_f = self.ensemble.top_features(5)
+        bandit_probs = self.ensemble.bandit.get_probs()
+        slide_acc = self.ensemble.sliding_accuracy()
+
+        result = {
+            'type': self.game_type,
+            'phien': next_phien,
+            'prediction': prediction,
+            'confidence': confidence,
+            'probability': round(prob, 4),
+            'arm_used': arm,
+            'top_features': top_f,
+            'sliding_accuracy': round(slide_acc, 4),
+            'model_accuracy': round(self.ensemble.accuracy, 4),
+            'bandit_weights': {k: round(v, 3) for k, v in bandit_probs.items()},
+            'timestamp': datetime.utcnow().isoformat() + 'Z',
+            'n_sessions': self.collector.count(self.game_type)
+        }
+
+        # Save prediction to DB
+        conn = get_db()
+        conn.execute(
+            "INSERT INTO predictions (type,phien,prediction,confidence,model_used) VALUES(?,?,?,?,?)",
+            (self.game_type, next_phien, prediction, round(prob,4), arm)
+        )
+        conn.commit(); conn.close()
+
+        return result
 
     def verify(self, phien: int, actual: str) -> Dict:
         """Cập nhật kết quả thực tế và feedback bandit."""
@@ -988,15 +996,28 @@ def predict_next(self) -> Dict:
             'sliding_accuracy': round(self.ensemble.sliding_accuracy(), 4)
         }
 
-def schedule_retrain(self) -> None:
-    def loop():
-        while True:
-            time.sleep(RETRAIN_INTERVAL)
-            n = self.collector.count(self.game_type)
-            log.info(f"[{self.game_type}] Scheduled retrain check: n={n}")
-            if n >= MIN_TRAIN and self.ensemble.is_trained:
-                self.train_async()
-    threading.Thread(target=loop, daemon=True).start()
+    def schedule_retrain(self) -> None:
+        def loop():
+            # FIX Bug1: Check ngay lập tức, không ngủ trước
+            # Vòng lặp 30s chờ đủ data rồi train
+            while not self.ensemble.is_trained:
+                n = self.collector.count(self.game_type)
+                if n >= MIN_TRAIN:
+                    log.info(f"[{self.game_type}] Enough data ({n}), triggering initial train.")
+                    self.train_async()
+                    time.sleep(120)  # chờ train xong
+                else:
+                    log.info(f"[{self.game_type}] Waiting for data: {n}/{MIN_TRAIN}")
+                    time.sleep(30)
+            # Sau khi trained: retrain định kỳ
+            while True:
+                time.sleep(RETRAIN_INTERVAL)
+                n = self.collector.count(self.game_type)
+                new = n - self._retrain_sessions
+                log.info(f"[{self.game_type}] Retrain check: n={n}, new={new}")
+                if new >= 100:
+                    self.train_async()
+        threading.Thread(target=loop, daemon=True).start()
 
 # ═══════════════════════════════════════════════════════════════════════════════
 #  AUTH MIDDLEWARE
@@ -1073,11 +1094,11 @@ async def require_auth(request: Request, admin_only: bool = False):
         inc_usage(key)
     return info
 
-def user_auth(request: Request):
-    return require_auth(request, admin_only=False)
+async def user_auth(request: Request):
+    return await require_auth(request, admin_only=False)
 
-def admin_auth(request: Request):
-    return require_auth(request, admin_only=True)
+async def admin_auth(request: Request):
+    return await require_auth(request, admin_only=True)
 
 # ═══════════════════════════════════════════════════════════════════════════════
 #  FASTAPI APP
@@ -1246,16 +1267,26 @@ async def startup():
         if not loaded:
             log.info(f"[{gt}] No saved model. Will train after data collection.")
 
-    # Initial data fetch
+    # FIX Bug4: Fetch nhiều lần cho đến khi đủ MIN_TRAIN ván rồi mới train
     collector = DataCollector()
     for gt in ['hu', 'md5']:
-        sessions = collector.fetch(gt)
-        if sessions:
-            n = collector.save(sessions)
-            total = collector.count(gt)
-            log.info(f"[{gt}] Initial fetch: +{n} new, total={total}")
-        # Trigger training if enough data
-        predictors[gt].train_async()
+        attempts = 0
+        while attempts < 15:  # tối đa 15 lần fetch (~3000 ván)
+            sessions = collector.fetch(gt)
+            if sessions:
+                n = collector.save(sessions)
+                total = collector.count(gt)
+                log.info(f"[{gt}] Fetch attempt {attempts+1}: +{n} new, total={total}")
+                if total >= MIN_TRAIN:
+                    break
+            attempts += 1
+            if attempts < 15:
+                time.sleep(2)  # nghỉ 2 giây giữa các lần fetch
+        total = collector.count(gt)
+        log.info(f"[{gt}] Initial accumulation done: {total} sessions")
+        if total >= MIN_TRAIN:
+            log.info(f"[{gt}] Triggering initial training ({total} >= {MIN_TRAIN}).")
+            predictors[gt].train_async()
 
     # Background jobs
     collector.run_background()
@@ -1272,5 +1303,5 @@ async def startup():
     log.info("═"*60)
 
 if __name__ == '__main__':
-    uvicorn.run('hyper_taixiu_predictor:app', host='0.0.0.0', port=PORT,
+    uvicorn.run('main:app', host='0.0.0.0', port=PORT,
                 workers=1, log_level='info')
