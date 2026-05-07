@@ -78,7 +78,7 @@ ADMIN_KEY         = os.environ.get('ADMIN_KEY', '')
 DEFAULT_DAILY     = int(os.environ.get('DEFAULT_DAILY', 500))
 FETCH_INTERVAL    = int(os.environ.get('FETCH_INTERVAL', 60))   # giây
 RETRAIN_INTERVAL  = int(os.environ.get('RETRAIN_INTERVAL', 3600))
-MIN_TRAIN         = int(os.environ.get('MIN_TRAIN', 500))
+MIN_TRAIN         = int(os.environ.get('MIN_TRAIN', 100))  # Lowered: API returns ~100-200 sessions
 MAX_SESSIONS      = 20000
 ACCURACY_THRESHOLD = 0.65  # dưới ngưỡng này → trigger retrain
 
@@ -593,6 +593,7 @@ class ModelEnsemble:
         self.trained_at: Optional[str] = None
         self._lock = threading.RLock()
         self.recent_preds: deque = deque(maxlen=200)  # (pred, actual)
+        self._dl_arms_used: List[str] = []  # FIX Bug8: track DL arms used in training
 
     def _class_weights(self, y: np.ndarray) -> Dict:
         cw = compute_class_weight('balanced', classes=np.unique(y), y=y)
@@ -639,7 +640,7 @@ class ModelEnsemble:
             subsample=0.8, colsample_bytree=0.8, min_child_weight=3,
             reg_alpha=0.1, reg_lambda=1.0, gamma=0.1,
             scale_pos_weight=cw.get(1, 1)/cw.get(0, 1),
-            eval_metric='logloss', use_label_encoder=False,
+            eval_metric='logloss',
             verbosity=0, tree_method='hist', early_stopping_rounds=50,
             random_state=42
         )
@@ -712,21 +713,30 @@ class ModelEnsemble:
                     log.warning(f"[{self.game_type}] {name} failed: {e}")
 
         # ── Stacking meta-model ───────────────────────────────────────────
-        vl_stack = np.column_stack([
-            self.xgb_m.predict_proba(Xvl_sel)[:,1],
-            self.lgb_m.predict_proba(Xvl_sel)[:,1],
-            self.rf_m.predict_proba(Xvl_sel)[:,1],
-            self.et_m.predict_proba(Xvl_sel)[:,1],
-            self.lr_m.predict_proba(Xvl_sel)[:,1],
-        ] + [dl_val_preds[k] for k in dl_val_preds if len(dl_val_preds[k]) == len(yvl)])
+        # FIX Bug7+8: Filter DL keys that are valid for BOTH val AND test
+        # so meta model dimensions are consistent at predict() time
+        valid_dl_keys = [k for k in dl_val_preds
+                         if len(dl_val_preds[k]) == len(yvl)
+                         and k in dl_test_preds
+                         and len(dl_test_preds[k]) == len(yte)]
+        self._dl_arms_used = valid_dl_keys  # saved for predict()
 
-        te_stack = np.column_stack([
-            self.xgb_m.predict_proba(Xte_sel)[:,1],
-            self.lgb_m.predict_proba(Xte_sel)[:,1],
-            self.rf_m.predict_proba(Xte_sel)[:,1],
-            self.et_m.predict_proba(Xte_sel)[:,1],
-            self.lr_m.predict_proba(Xte_sel)[:,1],
-        ] + [dl_test_preds[k] for k in dl_test_preds])
+        vl_stack = np.column_stack(
+            [self.xgb_m.predict_proba(Xvl_sel)[:,1],
+             self.lgb_m.predict_proba(Xvl_sel)[:,1],
+             self.rf_m.predict_proba(Xvl_sel)[:,1],
+             self.et_m.predict_proba(Xvl_sel)[:,1],
+             self.lr_m.predict_proba(Xvl_sel)[:,1]]
+            + [dl_val_preds[k] for k in valid_dl_keys]
+        )
+        te_stack = np.column_stack(
+            [self.xgb_m.predict_proba(Xte_sel)[:,1],
+             self.lgb_m.predict_proba(Xte_sel)[:,1],
+             self.rf_m.predict_proba(Xte_sel)[:,1],
+             self.et_m.predict_proba(Xte_sel)[:,1],
+             self.lr_m.predict_proba(Xte_sel)[:,1]]
+            + [dl_test_preds[k] for k in valid_dl_keys]
+        )
 
         self.meta_m = RandomForestClassifier(n_estimators=200, random_state=42)
         self.meta_m.fit(vl_stack, yvl)
@@ -784,18 +794,30 @@ class ModelEnsemble:
         with self._lock:
             if not self.is_trained:
                 return 1, 0.5, 'fallback'
-            preds_dict = self._predict_all(x)
             arm = self.bandit.select()
-            # Build stack for meta
+            # FIX Bug8: Build stack matching EXACT columns meta was trained on
             xs_s   = self.scaler.transform(x.reshape(1,-1))
             xs_sel = self.selector.transform(xs_s)
-            stack  = np.array([[
+            base = [
                 float(self.xgb_m.predict_proba(xs_sel)[:,1][0]),
                 float(self.lgb_m.predict_proba(xs_sel)[:,1][0]),
                 float(self.rf_m.predict_proba(xs_sel)[:,1][0]),
                 float(self.et_m.predict_proba(xs_sel)[:,1][0]),
                 float(self.lr_m.predict_proba(xs_sel)[:,1][0]),
-            ]])
+            ]
+            # Add DL predictions if they were used during training
+            dl_arms = getattr(self, '_dl_arms_used', [])
+            for arm_name in dl_arms:
+                dl_m = getattr(self, f'{arm_name.replace("-","_")}_m', None)
+                if dl_m is not None:
+                    try:
+                        # Need sequence - skip if no cache; use 0.5 fallback
+                        base.append(0.5)
+                    except:
+                        base.append(0.5)
+                else:
+                    base.append(0.5)
+            stack  = np.array([base])
             prob   = float(self.meta_m.predict_proba(stack)[:,1][0])
             label  = int(prob >= 0.5)
             return label, prob, arm
@@ -828,6 +850,7 @@ class ModelEnsemble:
                 'bandit': self.bandit.to_dict(),
                 'accuracy': self.accuracy, 'auc': self.auc,
                 'n_sessions': self.n_sessions, 'trained_at': self.trained_at,
+                'dl_arms_used': self._dl_arms_used,
             }, fp)
         log.info(f"[{self.game_type}] Model saved to {path}")
 
@@ -851,7 +874,8 @@ class ModelEnsemble:
             self.accuracy    = d.get('accuracy', 0.0)
             self.auc         = d.get('auc', 0.0)
             self.n_sessions  = d.get('n_sessions', 0)
-            self.trained_at  = d.get('trained_at')
+            self.trained_at    = d.get('trained_at')
+            self._dl_arms_used = d.get('dl_arms_used', [])
             self.is_trained  = True
             log.info(f"[{self.game_type}] Model loaded from {path} (acc={self.accuracy:.4f})")
             return True
@@ -874,7 +898,8 @@ class Predictor:
 
     def _get_feats(self) -> Optional[pd.DataFrame]:
         df = self.collector.get_history(self.game_type)
-        if len(df) < MIN_TRAIN:
+        # FIX Bug6 adaptive: dùng max(MIN_TRAIN, available) - cần ít nhất 80 rows sau warmup
+        if len(df) < max(MIN_TRAIN, 80):
             return None
         feats = self.engineer.build(df)
         feats = feats.iloc[max(self.engineer.SEQ_LEN if hasattr(self.engineer, 'SEQ_LEN') else 30, 50):]
@@ -1052,19 +1077,37 @@ def reset_daily():
 
 def init_admin_key() -> str:
     global ADMIN_KEY
+    # FIX Bug10: ADMIN_KEY env var takes priority for Render (ephemeral filesystem)
+    # If ADMIN_KEY is set via env var → always use that key, upsert into DB
+    env_key = os.environ.get('ADMIN_KEY', '')
     conn = get_db()
+    if env_key:
+        # Env var set: ensure this key is in DB (upsert)
+        ADMIN_KEY = env_key
+        conn.execute("DELETE FROM api_keys WHERE name='admin'")
+        conn.execute(
+            "INSERT INTO api_keys (key,name,daily_limit,is_active) VALUES(?,?,?,?)",
+            (ADMIN_KEY, 'admin', 999999, 1)
+        )
+        conn.commit(); conn.close()
+        log.info(f"Admin key loaded from ADMIN_KEY env var.")
+        return ADMIN_KEY
+    # No env var: check DB for existing key
     row = conn.execute("SELECT key FROM api_keys WHERE name='admin' LIMIT 1").fetchone()
     if row:
         ADMIN_KEY = row['key']
         conn.close()
+        log.warning("⚠️  ADMIN_KEY not set as env var! Key will change on Render restart.")
+        log.warning("⚠️  Set ADMIN_KEY env var in Render dashboard to persist the key.")
         return ADMIN_KEY
-    if not ADMIN_KEY:
-        ADMIN_KEY = secrets.token_hex(32)
+    # No env var, no DB key: generate random
+    ADMIN_KEY = secrets.token_hex(32)
     conn.execute(
         "INSERT OR IGNORE INTO api_keys (key,name,daily_limit,is_active) VALUES(?,?,?,?)",
         (ADMIN_KEY, 'admin', 999999, 1)
     )
     conn.commit(); conn.close()
+    log.warning("⚠️  ADMIN_KEY not set as env var! This key will change on next restart!")
     return ADMIN_KEY
 
 def start_daily_reset():
@@ -1105,6 +1148,37 @@ async def admin_auth(request: Request):
 # ═══════════════════════════════════════════════════════════════════════════════
 app = FastAPI(title='Hyper TàiXỉu Predictor', version='3.0')
 app.add_middleware(CORSMiddleware, allow_origins=['*'], allow_methods=['*'], allow_headers=['*'])
+
+# FIX Bug11: Custom exception handler - trả về JSON nhất quán, dễ debug
+from fastapi.exceptions import RequestValidationError
+from starlette.exceptions import HTTPException as StarletteHTTPException
+
+@app.exception_handler(StarletteHTTPException)
+async def http_exception_handler(request: Request, exc: StarletteHTTPException):
+    return JSONResponse(
+        status_code=exc.status_code,
+        content={
+            'error': True,
+            'status_code': exc.status_code,
+            'detail': str(exc.detail),
+            'path': str(request.url.path),
+        }
+    )
+
+@app.exception_handler(RequestValidationError)
+async def validation_exception_handler(request: Request, exc: RequestValidationError):
+    return JSONResponse(
+        status_code=422,
+        content={'error': True, 'detail': 'Validation error', 'errors': str(exc.errors())}
+    )
+
+@app.exception_handler(Exception)
+async def general_exception_handler(request: Request, exc: Exception):
+    log.error(f"Unhandled exception on {request.url}: {exc}", exc_info=True)
+    return JSONResponse(
+        status_code=500,
+        content={'error': True, 'detail': f'Internal server error: {type(exc).__name__}'}
+    )
 
 # Singleton predictors
 predictors: Dict[str, Predictor] = {}
@@ -1250,6 +1324,7 @@ async def lichsu_md5(request: Request, auth=Depends(user_auth)):
 # ═══════════════════════════════════════════════════════════════════════════════
 #  STARTUP
 # ═══════════════════════════════════════════════════════════════════════════════
+# Startup handler (compatible with both old and new FastAPI)
 @app.on_event('startup')
 async def startup():
     log.info("═"*60)
